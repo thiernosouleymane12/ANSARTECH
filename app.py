@@ -92,9 +92,12 @@ def _database_url():
     url = os.environ.get("DATABASE_URL", "").strip()
     if not url:
         return "sqlite:///" + os.path.join(BASE_DIR, "ansartech224.db")
-    # Render fournit parfois "postgres://" : SQLAlchemy exige "postgresql://"
-    if url.startswith("postgres://"):
-        url = url.replace("postgres://", "postgresql://", 1)
+    # Render fournit "postgres://" ou "postgresql://". On indique toujours le pilote installé
+    # (psycopg2) : SQLAlchemy 2.1 choisirait sinon un autre pilote (« psycopg ») absent.
+    for prefix in ("postgres://", "postgresql://"):
+        if url.startswith(prefix):
+            url = "postgresql+psycopg2://" + url[len(prefix):]
+            break
     return url
 
 
