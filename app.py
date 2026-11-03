@@ -65,7 +65,10 @@ from flask import (Blueprint, Flask, Response, abort, current_app, flash, g, has
 from flask_login import (LoginManager, UserMixin, current_user, login_required, login_user,
     logout_user)
 from flask_sqlalchemy import SQLAlchemy
-from flask_sqlalchemy.session import Session as FlaskSession
+try:  # Flask-SQLAlchemy 3.x
+    from flask_sqlalchemy.session import Session as FlaskSession
+except ImportError:  # anciennes versions
+    from flask_sqlalchemy import SignallingSession as FlaskSession
 from flask_wtf.csrf import CSRFProtect
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER, TA_RIGHT
@@ -108,6 +111,7 @@ def _database_url():
 
 class Config:
     APP_NAME = "ANSARTECH 224"
+    APP_VERSION = "2.1 — une base par entreprise"
     # Clé des sessions : variable SECRET_KEY sur Render, sinon clé aléatoire conservée en base
     # (voir _ensure_secret_key). L'ancienne clé publique d'exemple est refusée.
     _env_secret = os.environ.get("SECRET_KEY", "").strip()
@@ -1661,12 +1665,13 @@ def _render_pdf(invoice, s, company):
             PILImage.open(io.BytesIO(company.logo)).load()  # vérifie que l'image est lisible
             reader = ImageReader(io.BytesIO(company.logo))
             iw, ih = reader.getSize()
-            height = 14 * mm
-            width = min(height * iw / ih, 60 * mm)
+            # Logo carré : 24 mm de haut. Logo large (bannière) : jusqu'à 80 mm de large.
+            height = 24 * mm
+            width = min(height * iw / ih, 80 * mm)
             height = width * ih / iw
             logo = Image(io.BytesIO(company.logo), width=width, height=height)
             logo.hAlign = "CENTER"
-            story += [logo, Spacer(1, 2 * mm)]
+            story += [logo, Spacer(1, 3 * mm)]
         except Exception:  # logo illisible : on continue sans
             pass
     story.append(Paragraph(_clean(s.get("company_name")), st["company"]))
@@ -1832,7 +1837,7 @@ def _render_pdf(invoice, s, company):
     footer = {"color": brand, "lines": footer_lines[:2]}
 
     buffer = io.BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=A4, leftMargin=18 * mm, rightMargin=18 * mm, topMargin=12 * mm,
+    doc = SimpleDocTemplate(buffer, pagesize=A4, leftMargin=18 * mm, rightMargin=18 * mm, topMargin=15 * mm,
                             bottomMargin=23 * mm, title=f"{invoice.title} {invoice.number}",
                             author=str(s.get("company_name") or ""), subject=f"{invoice.title} - {invoice.client_name}",
                             creator="ANSARTECH 224")
@@ -3201,7 +3206,7 @@ settings_bp = Blueprint("settings", __name__, url_prefix="/parametres")
 
 CURRENCIES = ["GNF", "FCFA", "EUR", "USD"]
 LOGO_TYPES = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "webp": "image/webp"}
-MAX_LOGO_SIZE = 1024 * 1024  # 1 Mo
+MAX_LOGO_SIZE = 3 * 1024 * 1024  # 3 Mo
 COMPANY_FIELD_SIZES = {"name": 150, "activity": 150, "address": 255, "city": 80, "country": 80,
                        "phone": 60, "email": 120, "website": 150, "rccm": 80, "nif": 80}
 HEX_COLOR = re.compile(r"^#[0-9a-fA-F]{6}$")
@@ -3219,13 +3224,13 @@ def _image_type(data):
 
 
 def _normalize_logo(data):
-    """Vérifie l'image et la convertit en PNG de 600 px maximum (léger et lisible partout)."""
+    """Vérifie l'image et la convertit en PNG de 1600 px maximum (net à l'impression)."""
     from PIL import Image as PILImage
     try:
         image = PILImage.open(io.BytesIO(data))
         image.load()
         image = image.convert("RGBA")
-        image.thumbnail((600, 600))
+        image.thumbnail((1600, 1600))  # assez grand pour une impression nette
         out = io.BytesIO()
         image.save(out, format="PNG", optimize=True)
         return out.getvalue()
@@ -3265,7 +3270,7 @@ def settings_index():
                 errors.append("Logo : image PNG, JPG ou WEBP uniquement.")
                 logo_data = None
             elif len(logo_data) > MAX_LOGO_SIZE:
-                errors.append("Logo trop lourd (1 Mo maximum).")
+                errors.append("Logo trop lourd (3 Mo maximum).")
                 logo_data = None
             else:
                 logo_data = _normalize_logo(logo_data)
@@ -3595,6 +3600,39 @@ def enter_support(company_id):
     audit("acces_support", f"Ouverture de l'espace {company.name}", company_id=company.id)
     db.session.commit()
     return redirect(url_for("dashboard.index"))
+
+
+@platform_bp.route("/isolation")
+@superadmin_required
+def isolation():
+    """Preuve, sur le serveur réel, que chaque entreprise a sa propre base et rien d'autre."""
+    from sqlalchemy import inspect as sa_inspect
+    base = db.engine
+    mode = ("SQLite : un fichier par entreprise" if base.dialect.name == "sqlite"
+            else f"{base.dialect.name} : un schéma par entreprise")
+    shared = sorted(TENANT_TABLE_NAMES & set(sa_inspect(base).get_table_names()))
+    rows, all_ok = [], not shared
+    for company in Company.query.order_by(Company.name).all():
+        where = (os.path.join(_tenant_folder(base), f"entreprise_{company.id}.db")
+                 if base.dialect.name == "sqlite" else f"schéma « {tenant_schema(company.id)} »")
+        info = {"company": company, "where": where, "error": None, "counts": {}, "foreign": 0}
+        try:
+            engine = tenant_engine(company.id)
+            with engine.connect() as conn:
+                for model, label in ((Product, "produits"), (Sale, "ventes"), (Customer, "clients"),
+                                     (ProInvoice, "factures pro")):
+                    table = model.__table__
+                    info["counts"][label] = conn.execute(
+                        db.select(db.func.count()).select_from(table)).scalar()
+                    # lignes appartenant à une AUTRE entreprise : doit toujours être 0
+                    info["foreign"] += conn.execute(db.select(db.func.count()).select_from(table)
+                                                    .where(table.c.company_id != company.id)).scalar()
+            info["users"] = User.query.execution_options(skip_tenant=True).filter_by(company_id=company.id).count()
+        except Exception as exc:  # base inaccessible : on l'affiche
+            info["error"] = str(exc)[:300]
+        all_ok = all_ok and not info["error"] and info["foreign"] == 0
+        rows.append(info)
+    return render_template("platform/isolation.html", mode=mode, shared=shared, rows=rows, all_ok=all_ok)
 
 
 @platform_bp.route("/quitter-support", methods=["POST"])
@@ -3938,6 +3976,8 @@ def create_app(config_class=Config):
 
     with app.app_context():
         init_database(app)
+        app.logger.warning("ANSARTECH 224 version %s : isolation %s.", app.config["APP_VERSION"],
+                           "par fichier SQLite" if db.engine.dialect.name == "sqlite" else "par schéma PostgreSQL")
         # Ferme les connexions ouvertes avant que gunicorn ne crée ses workers
         db.session.remove()
         dispose_tenant_engines()
@@ -4653,6 +4693,7 @@ TEMPLATES = {
       <p class="nav-title">Plateforme</p>
       <a href="{{ url_for('platform.index') }}" class="{{ 'active' if ep in ('platform.index','platform.company_detail','platform.company_edit') }}"><i>🏢</i>Entreprises clientes</a>
       <a href="{{ url_for('platform.company_new') }}" class="nav-cta {{ 'active' if ep == 'platform.company_new' }}"><i>＋</i>Nouvelle entreprise</a>
+      <a href="{{ url_for('platform.isolation') }}" class="{{ 'active' if ep == 'platform.isolation' }}"><i>🛡</i>Contrôle d'isolation</a>
       <p class="nav-title">Mon compte</p>
       <a href="{{ url_for('auth.profile') }}" class="{{ 'active' if ep == 'auth.profile' }}"><i>👤</i>Mon profil</a>
       <a href="{{ url_for('auth.change_password') }}" class="{{ 'active' if ep == 'auth.change_password' }}"><i>🔑</i>Mot de passe</a>
@@ -4705,7 +4746,7 @@ TEMPLATES = {
     {% endif %}
     {% include "_flash.html" %}
     {% block content %}{% endblock %}
-    <footer class="footer">© {{ now.year }} {% if company %}{{ company.name }} · Propulsé par {% endif %}ANSARTECH 224</footer>
+    <footer class="footer">© {{ now.year }} {% if company %}{{ company.name }} · Propulsé par {% endif %}ANSARTECH 224 · version {{ config.APP_VERSION }}</footer>
   </main>
 {% else %}
   <main class="auth-main">
@@ -4949,6 +4990,45 @@ TEMPLATES = {
     <button class="btn" type="submit">{{ 'Enregistrer' if company else "Créer l'entreprise" }}</button>
   </div>
 </form>
+{% endblock %}
+''',
+
+# ---------------------------------------------------------------- platform/isolation.html
+'platform/isolation.html': r'''{% extends "base.html" %}
+{% block title %}Contrôle d'isolation{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div><h1>Contrôle d'isolation</h1><p>Vérification en direct sur ce serveur · version {{ config.APP_VERSION }} · {{ mode }}</p></div>
+</div>
+{% if all_ok %}
+<div class="advice success">Isolation correcte : chaque entreprise a sa propre base, aucune donnée d'une autre entreprise n'y figure, et aucune table commerciale n'est partagée.</div>
+{% else %}
+<div class="advice danger">Problème détecté : voir le détail ci-dessous.</div>
+{% endif %}
+{% if shared %}
+<div class="advice warning">Tables commerciales encore présentes dans la base commune : {{ shared|join(', ') }}. Redémarrez le service pour lancer la migration.</div>
+{% endif %}
+<div class="card flush">
+  <div class="table-wrap"><table>
+    <thead><tr><th>Entreprise</th><th>Emplacement des données</th><th class="num">Utilisateurs</th><th class="num">Produits</th><th class="num">Ventes</th><th class="num">Clients</th><th class="num">Factures pro</th><th>Données étrangères</th></tr></thead>
+    <tbody>{% for r in rows %}
+      <tr><td><a class="cell-title" href="{{ url_for('platform.company_detail', company_id=r.company.id) }}">{{ r.company.name }}</a><span class="cell-sub">n° {{ r.company.id }} · {{ r.company.code }}</span></td>
+        <td>{% if r.error %}<span class="badge badge-danger">Erreur</span><span class="cell-sub">{{ r.error }}</span>{% else %}{{ r.where }}{% endif %}</td>
+        <td class="num">{{ r.users if r.users is defined else '—' }}</td>
+        <td class="num">{{ r.counts.get('produits', '—') }}</td><td class="num">{{ r.counts.get('ventes', '—') }}</td>
+        <td class="num">{{ r.counts.get('clients', '—') }}</td><td class="num">{{ r.counts.get('factures pro', '—') }}</td>
+        <td>{% if r.error %}—{% elif r.foreign == 0 %}<span class="badge badge-success">0 · OK</span>{% else %}<span class="badge badge-danger">{{ r.foreign }}</span>{% endif %}</td></tr>
+    {% else %}<tr><td colspan="8" class="empty">Aucune entreprise.</td></tr>{% endfor %}</tbody>
+  </table></div>
+</div>
+<div class="card">
+  <h2>Comment tester vous-même</h2>
+  <ul class="list-plain">
+    <li><span>1. Créez chaque client depuis <b>Plateforme → Nouvelle entreprise</b> (jamais depuis « Utilisateurs », qui ajoute des employés à l'entreprise connectée).</span></li>
+    <li><span>2. Connectez-vous avec l'identifiant de l'administrateur de l'entreprise A, pas avec le super-admin (qui voit tout en mode support).</span></li>
+    <li><span>3. Pour tester A et B en même temps, utilisez deux navigateurs différents (ou une fenêtre privée) : un même navigateur partage une seule connexion.</span></li>
+  </ul>
+</div>
 {% endblock %}
 ''',
 
@@ -6072,7 +6152,7 @@ TEMPLATES = {
   .sheet { background: #fff; margin: 0 auto 2rem; padding: 2.2rem 2.4rem; max-width: 210mm; min-height: 270mm; box-shadow: 0 4px 24px rgba(0,0,0,.12); position: relative; }
   .head { display: flex; justify-content: space-between; gap: 1.5rem; flex-wrap: wrap; border-bottom: 3px solid var(--brand); padding-bottom: 1rem; }
   .company { display: flex; gap: .8rem; }
-  .company img { width: 72px; height: 72px; object-fit: contain; }
+  .company img { width: auto; height: auto; max-width: 230px; max-height: 80px; object-fit: contain; align-self: flex-start; }
   .initial { width: 56px; height: 56px; border-radius: 10px; background: var(--brand); color: #fff; display: grid; place-items: center; font-size: 1.6rem; font-weight: 800; flex-shrink: 0; }
   .addr { white-space: pre-line; }
   .extra { margin-top: 1.2rem; display: grid; gap: .6rem; font-size: .85rem; }
@@ -6103,7 +6183,7 @@ TEMPLATES = {
   .ticket .sheet { max-width: 80mm; min-height: 0; padding: 4mm; font-size: 12px; }
   .ticket .head { flex-direction: column; align-items: center; text-align: center; border-bottom: 1px dashed #000; }
   .ticket .company { flex-direction: column; align-items: center; }
-  .ticket .company img { width: 36px; height: 36px; }
+  .ticket .company img { max-width: 52mm; max-height: 18mm; align-self: center; }
   .ticket .meta { text-align: center; }
   .ticket .meta h2 { font-size: 1rem; }
   .ticket .parties { margin: .5rem 0; }
@@ -6248,7 +6328,7 @@ TEMPLATES = {
     <div class="swatch-row" style="flex-wrap:wrap;gap:1rem">
       {% if company.logo %}<img class="logo-preview" src="{{ url_for('settings.logo', v=company.id) }}" alt="Logo actuel">{% else %}<div class="logo-preview" style="display:grid;place-items:center;color:var(--muted);font-size:.8rem">Aucun logo</div>{% endif %}
       <div class="field" style="flex:1;min-width:220px"><label for="logo">Nouveau logo</label><input type="file" id="logo" name="logo" accept=".png,.jpg,.jpeg,.webp">
-        <div class="hint">PNG, JPG ou WEBP, 1 Mo maximum. Idéalement carré, fond transparent ou blanc.</div>
+        <div class="hint">PNG, JPG ou WEBP, 3 Mo maximum. Idéalement au moins 1000 pixels de large, fond transparent ou blanc.</div>
         {% if company.logo %}<label class="check" style="margin-top:.5rem"><input type="checkbox" name="remove_logo" value="1"> Supprimer le logo actuel</label>{% endif %}</div>
     </div>
   </div>
@@ -6527,7 +6607,7 @@ img { max-width: 100%; }
 .icon-btn .dot { position: absolute; top: -2px; right: -4px; background: var(--red); color: #fff; font-size: .65rem; border-radius: 10px; padding: 1px 5px; }
 
 .company-chip { display: flex; align-items: center; gap: .6rem; margin: 0 .9rem .6rem; padding: .55rem .7rem; border-radius: 10px; background: rgba(255,255,255,.07); color: #fff; font-weight: 600; font-size: .9rem; line-height: 1.2; }
-.company-chip img { width: 30px; height: 30px; object-fit: contain; background: #fff; border-radius: 6px; padding: 2px; }
+.company-chip img { width: auto; max-width: 64px; height: 30px; object-fit: contain; background: #fff; border-radius: 6px; padding: 2px; }
 .company-chip small { display: block; color: var(--accent); font-weight: 500; font-size: .72rem; }
 .company-initial { width: 30px; height: 30px; border-radius: 6px; background: var(--accent); color: #2b2100; display: grid; place-items: center; font-weight: 800; flex-shrink: 0; }
 .support-banner { display: flex; justify-content: space-between; align-items: center; gap: 1rem; flex-wrap: wrap; background: #fff4d1; border: 1px solid #f2d27a; color: #6b4b00; padding: .6rem 1rem; border-radius: 10px; margin-bottom: 1rem; }
@@ -6695,7 +6775,7 @@ input:focus, select:focus, textarea:focus { outline: 2px solid rgba(11, 93, 67, 
 .pv { --brand: #0b5d43; background: #fff; border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow);
       padding: 2.25rem 2.5rem; max-width: 860px; margin: 0 auto; color: #1b2420; }
 .pv-head { text-align: center; }
-.pv-head img { max-height: 76px; max-width: 220px; object-fit: contain; margin-bottom: .5rem; }
+.pv-head img { max-height: 84px; max-width: 280px; object-fit: contain; margin: 0 auto .6rem; display: block; }
 .pv-company { font-size: 1.6rem; font-weight: 800; color: var(--brand); line-height: 1.2; }
 .pv-activity { font-style: italic; color: #5b6661; margin-top: .1rem; }
 .pv-small { font-size: .85rem; color: #5b6661; margin-top: .15rem; }
@@ -6758,7 +6838,7 @@ input:focus, select:focus, textarea:focus { outline: 2px solid rgba(11, 93, 67, 
   .topbar .icon-btn { color: #fff; }
   .topbar .icon-btn:hover { background: rgba(255,255,255,.12); }
   .brand-sm { display: flex; align-items: center; gap: .5rem; color: #fff; font-weight: 700; letter-spacing: .03em; }
-  .brand-sm img { width: 26px; height: 26px; object-fit: contain; background: #fff; border-radius: 5px; }
+  .brand-sm img { width: auto; max-width: 70px; height: 26px; object-fit: contain; background: #fff; border-radius: 5px; }
   .main { margin-left: 0; padding: 1rem .85rem; }
   .grid-2, .grid-3, .form-grid { grid-template-columns: 1fr; }
   .card { padding: 1rem; }
