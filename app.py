@@ -6,6 +6,9 @@ ANSARTECH 224 — Logiciel de gestion commerciale multi-entreprises (fichier uni
 Produits, stocks, achats, ventes, factures, analyses, archives, messagerie,
 plateforme multi-entreprises (abonnements, adresses, logo et facture par entreprise).
 
+Sécurité : chaque entreprise cliente a sa PROPRE base de données (aucune table partagée)
+et ses propres comptes. La plateforme ne garde que les comptes et la liste des entreprises.
+
 Tout le logiciel est dans ce seul fichier : code Python, pages HTML, styles et scripts.
 
 En local :     pip install -r requirements.txt   puis   python app.py
@@ -16,6 +19,7 @@ Sommaire (cherchez ces titres) :
     • ÉTAPE 1 — CONFIGURATION
     • EXTENSIONS (base de données, connexion, CSRF)
     • ÉTAPE 2 — BASE DE DONNÉES (modèles)
+    • UNE BASE DE DONNÉES PAR ENTREPRISE (fichier SQLite ou schéma PostgreSQL séparé)
     • MULTI-ENTREPRISES (isolation automatique des données)
     • FONCTIONS UTILITAIRES
     • INITIALISATION, CRÉATION D'ENTREPRISE, DÉMONSTRATION
@@ -61,6 +65,7 @@ from flask import (Blueprint, Flask, Response, abort, current_app, flash, g, has
 from flask_login import (LoginManager, UserMixin, current_user, login_required, login_user,
     logout_user)
 from flask_sqlalchemy import SQLAlchemy
+from flask_sqlalchemy.session import Session as FlaskSession
 from flask_wtf.csrf import CSRFProtect
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER, TA_RIGHT
@@ -103,7 +108,11 @@ def _database_url():
 
 class Config:
     APP_NAME = "ANSARTECH 224"
-    SECRET_KEY = os.environ.get("SECRET_KEY") or "dev-cle-a-changer-en-production"
+    # Clé des sessions : variable SECRET_KEY sur Render, sinon clé aléatoire conservée en base
+    # (voir _ensure_secret_key). L'ancienne clé publique d'exemple est refusée.
+    _env_secret = os.environ.get("SECRET_KEY", "").strip()
+    SECRET_KEY_FROM_ENV = bool(_env_secret) and _env_secret != "dev-cle-a-changer-en-production"
+    SECRET_KEY = _env_secret if SECRET_KEY_FROM_ENV else secrets.token_hex(32)
     SQLALCHEMY_DATABASE_URI = _database_url()
     SQLALCHEMY_TRACK_MODIFICATIONS = False
     SQLALCHEMY_ENGINE_OPTIONS = {"pool_pre_ping": True, "pool_recycle": 280}
@@ -111,7 +120,7 @@ class Config:
     # Sécurité des sessions
     SESSION_COOKIE_HTTPONLY = True
     SESSION_COOKIE_SAMESITE = "Lax"
-    SESSION_COOKIE_SECURE = os.environ.get("FLASK_ENV") == "production"
+    SESSION_COOKIE_SECURE = os.environ.get("FLASK_ENV") == "production" or bool(os.environ.get("RENDER"))
     REMEMBER_COOKIE_HTTPONLY = True
     REMEMBER_COOKIE_SECURE = SESSION_COOKIE_SECURE
     PERMANENT_SESSION_LIFETIME = timedelta(hours=8)
@@ -147,7 +156,38 @@ class TestConfig(Config):
 # EXTENSIONS (base de données, connexion, CSRF)
 # ==================================================================================================
 
-db = SQLAlchemy()
+class TenantSession(FlaskSession):
+    """Session qui envoie chaque requête vers la bonne base de données.
+
+    - companies, users, audit_logs, share_links, platform_settings → base de la plateforme ;
+    - toutes les autres tables (produits, ventes, stocks…) → base PRIVÉE de l'entreprise active.
+    Sans entreprise active, l'accès aux données d'entreprise est refusé (aucune base par défaut).
+    """
+
+    def get_bind(self, mapper=None, clause=None, bind=None, **kwargs):
+        if bind is not None:
+            return bind
+        table = _mapped_table(mapper)
+        if table is not None and table.name in TENANT_TABLE_NAMES:
+            company_id = current_company_id()
+            if company_id is None:
+                raise RuntimeError(f"Accès refusé : aucune entreprise active pour la table « {table.name} ».")
+            return tenant_engine(company_id)
+        return super().get_bind(mapper=mapper, clause=clause, bind=bind, **kwargs)
+
+
+def _mapped_table(mapper):
+    if mapper is None:
+        return None
+    try:
+        from sqlalchemy import inspect as sa_inspect
+        info = sa_inspect(mapper)
+        return getattr(info, "local_table", None) if info is not None else None
+    except Exception:
+        return getattr(mapper, "local_table", None)
+
+
+db = SQLAlchemy(session_options={"class_": TenantSession})
 login_manager = LoginManager()
 csrf = CSRFProtect()
 
@@ -175,7 +215,9 @@ class TenantMixin:
 
     @db.declared_attr
     def company_id(cls):
-        return db.Column(db.Integer, db.ForeignKey("companies.id"), nullable=False, index=True)
+        # Pas de clé étrangère : la table vit dans la base privée de l'entreprise,
+        # la table « companies » est dans la base de la plateforme.
+        return db.Column(db.Integer, nullable=False, index=True)
 
 
 class Company(db.Model):
@@ -253,6 +295,9 @@ class User(UserMixin, db.Model):
     last_login = db.Column(db.DateTime)
     created_at = db.Column(db.DateTime, default=now)
 
+    def get_id(self):
+        return f"{self.id}.{_session_stamp(self)}"
+
     def set_password(self, password):
         self.password_hash = generate_password_hash(password)
 
@@ -286,9 +331,21 @@ class User(UserMixin, db.Model):
         return self.effective_role in roles
 
 
+def _session_stamp(user):
+    """Empreinte du mot de passe : changer le mot de passe invalide toutes les sessions ouvertes."""
+    import hashlib
+    return hashlib.sha256(f"{user.id}:{user.password_hash}".encode()).hexdigest()[:20]
+
+
 @login_manager.user_loader
 def load_user(user_id):
-    return db.session.get(User, int(user_id))
+    raw_id, _, stamp = str(user_id).partition(".")
+    if not raw_id.isdigit() or not stamp:
+        return None  # ancien format de cookie : reconnexion demandée
+    user = db.session.get(User, int(raw_id))
+    if user is None or not secrets.compare_digest(stamp, _session_stamp(user)):
+        return None
+    return user
 
 
 # ---------------------------------------------------------------- Produits
@@ -363,8 +420,8 @@ class StockMovement(TenantMixin, db.Model):
     stock_after = db.Column(db.Float, nullable=False)
     reason = db.Column(db.String(255))
     reference = db.Column(db.String(60))
-    user_id = db.Column(db.Integer, db.ForeignKey("users.id"))
-    user = db.relationship("User")
+    user_id = db.Column(db.Integer)  # compte de la plateforme (autre base)
+    user = db.relationship("User", primaryjoin="foreign(StockMovement.user_id) == User.id")
     created_at = db.Column(db.DateTime, default=now, index=True)
 
     @property
@@ -400,8 +457,8 @@ class Purchase(TenantMixin, db.Model):
     total = db.Column(db.Float, default=0, nullable=False)
     amount_paid = db.Column(db.Float, default=0, nullable=False)
     notes = db.Column(db.Text)
-    user_id = db.Column(db.Integer, db.ForeignKey("users.id"))
-    user = db.relationship("User")
+    user_id = db.Column(db.Integer)  # compte de la plateforme (autre base)
+    user = db.relationship("User", primaryjoin="foreign(Purchase.user_id) == User.id")
     created_at = db.Column(db.DateTime, default=now, index=True)
     received_at = db.Column(db.DateTime)
     items = db.relationship("PurchaseItem", back_populates="purchase", cascade="all, delete-orphan")
@@ -469,8 +526,8 @@ class Sale(TenantMixin, db.Model):
     payment_method = db.Column(db.String(30), default="especes")
     status = db.Column(db.String(20), default="payee", nullable=False)
     notes = db.Column(db.Text)
-    user_id = db.Column(db.Integer, db.ForeignKey("users.id"))
-    user = db.relationship("User")
+    user_id = db.Column(db.Integer)  # compte de la plateforme (autre base)
+    user = db.relationship("User", primaryjoin="foreign(Sale.user_id) == User.id")
     created_at = db.Column(db.DateTime, default=now, index=True)
     items = db.relationship("SaleItem", back_populates="sale", cascade="all, delete-orphan")
 
@@ -529,8 +586,8 @@ class Document(TenantMixin, db.Model):
     mimetype = db.Column(db.String(120))
     size = db.Column(db.Integer, default=0)
     data = db.Column(db.LargeBinary, nullable=False)
-    uploaded_by = db.Column(db.Integer, db.ForeignKey("users.id"))
-    uploader = db.relationship("User")
+    uploaded_by = db.Column(db.Integer)
+    uploader = db.relationship("User", primaryjoin="foreign(Document.uploaded_by) == User.id")
     created_at = db.Column(db.DateTime, default=now, index=True)
 
     @property
@@ -541,10 +598,10 @@ class Document(TenantMixin, db.Model):
 class Message(TenantMixin, db.Model):
     __tablename__ = "messages"
     id = db.Column(db.Integer, primary_key=True)
-    sender_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
-    sender = db.relationship("User", foreign_keys=[sender_id])
-    recipient_id = db.Column(db.Integer, db.ForeignKey("users.id"))  # vide = tout le monde
-    recipient = db.relationship("User", foreign_keys=[recipient_id])
+    sender_id = db.Column(db.Integer, nullable=False)
+    sender = db.relationship("User", primaryjoin="foreign(Message.sender_id) == User.id")
+    recipient_id = db.Column(db.Integer)  # vide = tout le monde
+    recipient = db.relationship("User", primaryjoin="foreign(Message.recipient_id) == User.id")
     subject = db.Column(db.String(200), nullable=False)
     body = db.Column(db.Text, nullable=False)
     is_read = db.Column(db.Boolean, default=False, nullable=False)
@@ -622,8 +679,8 @@ class ProInvoice(TenantMixin, db.Model):
     amount_paid = db.Column(db.Float, default=0, nullable=False)
     notes = db.Column(db.Text)
     share_token = db.Column(db.String(64), unique=True, index=True)
-    user_id = db.Column(db.Integer, db.ForeignKey("users.id"))
-    user = db.relationship("User")
+    user_id = db.Column(db.Integer)  # compte de la plateforme (autre base)
+    user = db.relationship("User", primaryjoin="foreign(ProInvoice.user_id) == User.id")
     created_at = db.Column(db.DateTime, default=now, index=True)
     updated_at = db.Column(db.DateTime, default=now, onupdate=now)
     lines = db.relationship("ProInvoiceLine", back_populates="invoice", cascade="all, delete-orphan",
@@ -667,6 +724,229 @@ class ProInvoiceLine(db.Model):
     @property
     def total(self):
         return round((self.quantity or 0) * (self.unit_price or 0), 2)
+
+
+# ---------------------------------------------------------------- Tables de la plateforme
+class ShareLink(db.Model):
+    """Annuaire des liens publics de Facture Pro : jeton → entreprise propriétaire.
+
+    Le PDF lui-même reste dans la base privée de l'entreprise ; ce registre sert seulement
+    à savoir dans quelle base aller le chercher, sans jamais parcourir les autres entreprises.
+    """
+    __tablename__ = "share_links"
+    token = db.Column(db.String(64), primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey("companies.id"), nullable=False, index=True)
+    created_at = db.Column(db.DateTime, default=now)
+
+
+class PlatformSetting(db.Model):
+    """Réglages internes de la plateforme (ex. clé secrète des sessions)."""
+    __tablename__ = "platform_settings"
+    key = db.Column(db.String(60), primary_key=True)
+    value = db.Column(db.Text)
+
+
+# Tables stockées dans la base de la plateforme (comptes, entreprises, journal)
+PLATFORM_MODELS = (Company, User, AuditLog, ShareLink, PlatformSetting)
+# Tables stockées dans la base PRIVÉE de chaque entreprise (une base par client)
+TENANT_MODELS = (Category, Product, StockMovement, Supplier, Purchase, PurchaseItem, Customer, Sale,
+                 SaleItem, Document, Message, Setting, ProInvoice, ProInvoiceLine)
+PLATFORM_TABLES = [m.__table__ for m in PLATFORM_MODELS]
+TENANT_TABLES = [m.__table__ for m in TENANT_MODELS]
+TENANT_TABLE_NAMES = frozenset(t.name for t in TENANT_TABLES)
+# Tables « lignes » sans company_id : rattachées à l'entreprise par leur document parent
+TENANT_CHILD_TABLES = {"purchase_items": ("purchase_id", "purchases"),
+                       "sale_items": ("sale_id", "sales"),
+                       "pro_invoice_lines": ("invoice_id", "pro_invoices")}
+
+
+# ==================================================================================================
+# UNE BASE DE DONNÉES PAR ENTREPRISE
+# ==================================================================================================
+# • En local (SQLite) : un fichier par entreprise, bases_entreprises/entreprise_<id>.db
+# • Sur Render (PostgreSQL) : un schéma séparé par entreprise, « entreprise_<id> »
+#   (une base PostgreSQL contient plusieurs schémas étanches : chaque entreprise a ses propres tables).
+# Les comptes et les entreprises restent dans la base principale de la plateforme.
+
+import threading
+from sqlalchemy import create_engine, text
+from sqlalchemy.pool import StaticPool
+
+_tenant_engines = {}
+_tenant_ready = set()
+_tenant_lock = threading.Lock()
+
+
+def tenant_schema(company_id):
+    return f"entreprise_{int(company_id)}"
+
+
+def _tenant_folder(base):
+    folder = os.environ.get("TENANT_DB_DIR")
+    if not folder:
+        main_file = base.url.database or ""
+        folder = os.path.join(os.path.dirname(os.path.abspath(main_file)) if main_file else BASE_DIR,
+                              "bases_entreprises")
+    return folder
+
+
+def _is_memory_sqlite(base):
+    return base.dialect.name == "sqlite" and base.url.database in (None, "", ":memory:")
+
+
+def _build_tenant_engine(base, company_id):
+    if base.dialect.name == "sqlite":
+        if _is_memory_sqlite(base):
+            return create_engine("sqlite://", poolclass=StaticPool, connect_args={"check_same_thread": False})
+        folder = _tenant_folder(base)
+        os.makedirs(folder, exist_ok=True)
+        return create_engine("sqlite:///" + os.path.join(folder, f"entreprise_{int(company_id)}.db"))
+    # PostgreSQL (et autres) : même serveur, schéma privé. Toutes les tables de l'entreprise
+    # sont automatiquement préfixées par son schéma.
+    return base.execution_options(schema_translate_map={None: tenant_schema(company_id)})
+
+
+def _create_tenant_tables(base, engine, company_id):
+    try:
+        if base.dialect.name != "sqlite":
+            with base.begin() as conn:
+                conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{tenant_schema(company_id)}"'))
+        db.metadata.create_all(bind=engine, tables=TENANT_TABLES)
+    except (OperationalError, ProgrammingError, IntegrityError):
+        # un autre processus vient de créer la base en même temps : on continue
+        pass
+
+
+def tenant_engine(company_id):
+    """Moteur de la base privée d'une entreprise (créée automatiquement à la première utilisation)."""
+    company_id = int(company_id)
+    base = db.engine
+    key = (id(base), company_id)
+    with _tenant_lock:
+        engine = _tenant_engines.get(key)
+        if engine is None:
+            engine = _build_tenant_engine(base, company_id)
+            _tenant_engines[key] = engine
+        if key not in _tenant_ready:
+            _create_tenant_tables(base, engine, company_id)
+            _tenant_ready.add(key)
+    return engine
+
+
+def dispose_tenant_engines():
+    """Ferme les connexions des bases d'entreprise (avant que gunicorn ne crée ses workers)."""
+    with _tenant_lock:
+        for engine in _tenant_engines.values():
+            if hasattr(engine, "dispose") and type(engine).__name__ != "OptionEngine":
+                engine.dispose()
+        _tenant_engines.clear()
+        _tenant_ready.clear()
+
+
+def _drop_tenant_databases(base):
+    dispose_tenant_engines()
+    if base.dialect.name == "sqlite":
+        if _is_memory_sqlite(base):
+            return
+        folder = _tenant_folder(base)
+        if os.path.isdir(folder):
+            for name in os.listdir(folder):
+                if re.fullmatch(r"entreprise_\d+\.db(-journal|-wal|-shm)?", name):
+                    os.remove(os.path.join(folder, name))
+        return
+    with base.begin() as conn:
+        schemas = conn.execute(text("SELECT schema_name FROM information_schema.schemata "
+                                    "WHERE schema_name LIKE 'entreprise\\_%'")).scalars().all()
+        for schema in schemas:
+            if re.fullmatch(r"entreprise_\d+", schema):
+                conn.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
+
+
+def _fix_sequences(base, company_id):
+    """PostgreSQL : après une copie avec identifiants, les compteurs repartent du bon numéro."""
+    if base.dialect.name != "postgresql":
+        return
+    schema = tenant_schema(company_id)
+    with base.begin() as conn:
+        for table in TENANT_TABLES:
+            if "id" not in table.c:
+                continue
+            qualified = f'"{schema}"."{table.name}"'
+            conn.execute(text(
+                f"SELECT setval(pg_get_serial_sequence('{qualified}', 'id'), "
+                f"COALESCE((SELECT MAX(id) FROM {qualified}), 0) + 1, false)"))
+
+
+def migrate_shared_tables(app):
+    """Ancienne version : toutes les entreprises partageaient les mêmes tables.
+
+    Copie les données de chaque entreprise dans SA base privée, puis renomme les anciennes
+    tables communes en « ancien_… » (rien n'est supprimé ; l'application ne les lit plus).
+    Peut être relancée sans risque : la base privée est vidée avant chaque copie.
+    """
+    from sqlalchemy import MetaData, inspect as sa_inspect, select
+    base = db.engine
+    existing = set(sa_inspect(base).get_table_names())
+    names = [t.name for t in TENANT_TABLES if t.name in existing]
+    if not names:
+        return
+    app.logger.warning("Migration : séparation des données de chaque entreprise dans sa propre base…")
+    old_meta = MetaData()
+    old_meta.reflect(bind=base, only=names)
+    company_ids = [row[0] for row in db.session.query(Company.id).order_by(Company.id)]
+    db.session.commit()
+    ordered = [t for t in db.metadata.sorted_tables if t.name in TENANT_TABLE_NAMES]
+
+    with base.connect() as src:
+        for company_id in company_ids:
+            engine = tenant_engine(company_id)
+            copied = 0
+            with engine.begin() as dst:
+                for table in reversed(ordered):
+                    dst.execute(table.delete())
+                for table in ordered:
+                    old = old_meta.tables.get(table.name)
+                    if old is None:
+                        continue
+                    columns = [c.name for c in table.columns if c.name in old.c]
+                    query = select(*[old.c[name] for name in columns])
+                    if "company_id" in old.c:
+                        query = query.where(old.c.company_id == company_id)
+                    elif table.name in TENANT_CHILD_TABLES:
+                        fk, parent_name = TENANT_CHILD_TABLES[table.name]
+                        parent = old_meta.tables.get(parent_name)
+                        if parent is None or "company_id" not in parent.c:
+                            continue
+                        query = query.where(old.c[fk].in_(
+                            select(parent.c.id).where(parent.c.company_id == company_id)))
+                    else:
+                        continue
+                    rows = [dict(row._mapping) for row in src.execute(query)]
+                    for start in range(0, len(rows), 500):
+                        dst.execute(table.insert(), rows[start:start + 500])
+                    copied += len(rows)
+            _fix_sequences(base, company_id)
+
+            old_invoices = old_meta.tables.get("pro_invoices")
+            if old_invoices is not None and "share_token" in old_invoices.c and "company_id" in old_invoices.c:
+                tokens = src.execute(select(old_invoices.c.share_token).where(
+                    old_invoices.c.company_id == company_id, old_invoices.c.share_token.isnot(None))).scalars()
+                for token in tokens:
+                    if not db.session.get(ShareLink, token):
+                        db.session.add(ShareLink(token=token, company_id=company_id))
+                db.session.commit()
+            app.logger.warning("  entreprise %s : %s ligne(s) copiée(s) dans sa base privée.", company_id, copied)
+        src.rollback()
+
+    with base.begin() as conn:
+        taken = set(sa_inspect(conn).get_table_names())
+        for name in names:
+            new_name, n = f"ancien_{name}", 2
+            while new_name in taken:
+                new_name, n = f"ancien{n}_{name}", n + 1
+            conn.execute(text(f'ALTER TABLE "{name}" RENAME TO "{new_name}"'))
+            taken.add(new_name)
+    app.logger.warning("Migration terminée : les anciennes tables communes sont renommées « ancien_… ».")
 
 
 # ==================================================================================================
@@ -941,6 +1221,29 @@ def _reset_database():
     meta = MetaData()
     meta.reflect(bind=db.engine)
     meta.drop_all(bind=db.engine)
+    _drop_tenant_databases(db.engine)
+
+
+def _ensure_secret_key(app):
+    """Clé des cookies de session : jamais la clé d'exemple publique.
+
+    Si SECRET_KEY n'est pas défini (ou vaut l'ancienne valeur par défaut), une clé aléatoire
+    est générée une seule fois et conservée dans la base : identique pour tous les workers
+    et après chaque redéploiement. Sans cela, n'importe qui pouvait fabriquer un cookie et
+    entrer dans le compte de n'importe quelle entreprise sans mot de passe.
+    """
+    if app.config.get("SECRET_KEY_FROM_ENV") or app.config.get("TESTING"):
+        return
+    row = db.session.get(PlatformSetting, "secret_key")
+    if row is None:
+        db.session.add(PlatformSetting(key="secret_key", value=secrets.token_hex(32)))
+        try:
+            db.session.commit()
+        except IntegrityError:  # créée au même moment par un autre processus
+            db.session.rollback()
+        row = db.session.get(PlatformSetting, "secret_key")
+    app.config["SECRET_KEY"] = row.value
+    app.secret_key = row.value
 
 
 def init_database(app):
@@ -957,10 +1260,15 @@ def init_database(app):
         return
 
     try:
-        db.create_all()
+        # Base de la plateforme : uniquement comptes, entreprises, journal, liens publics.
+        # Les données commerciales vont dans la base privée de chaque entreprise.
+        db.metadata.create_all(bind=db.engine, tables=PLATFORM_TABLES)
     except (OperationalError, ProgrammingError, IntegrityError):
         # Un autre processus vient de créer les tables : on continue
         db.session.rollback()
+
+    _ensure_secret_key(app)
+    migrate_shared_tables(app)
 
     username = app.config["ADMIN_USERNAME"].strip().lower()
     password = app.config["ADMIN_PASSWORD"]
@@ -1013,6 +1321,7 @@ def create_company(name, admin_username, admin_password, admin_full_name="Admini
     company = Company(name=name, code=fields.pop("code", None) or unique_company_code(name), **fields)
     db.session.add(company)
     db.session.flush()
+    tenant_engine(company.id)  # crée la base privée de l'entreprise
     admin = User(username=admin_username.lower(), full_name=admin_full_name, role="admin",
                  company_id=company.id, must_change_password=must_change_password)
     admin.set_password(admin_password)
@@ -1643,6 +1952,8 @@ def change_password():
             current_user.must_change_password = False
             audit("changement_mot_de_passe", current_user.username)
             db.session.commit()
+            # nouvelle session (les autres sessions ouvertes avec l'ancien mot de passe sont fermées)
+            login_user(current_user._get_current_object())
             flash("Mot de passe modifié avec succès.", "success")
             return redirect(url_for("dashboard.index"))
     return render_template("auth/change_password.html")
@@ -1738,6 +2049,8 @@ def user_form(user_id=None):
                 user.must_change_password = True
         audit("creation_utilisateur" if creating else "modification_utilisateur", username)
         db.session.commit()
+        if password and user.id == current_user.id:
+            login_user(user)
         flash("Utilisateur enregistré.", "success")
         return redirect(url_for("auth.users"))
     return render_template("auth/user_form.html", user=user, roles=TENANT_ROLES, form={})
@@ -3080,6 +3393,12 @@ def _parse_iso_date(value):
 
 
 def _company_stats(company):
+    """Chiffres d'une entreprise, lus dans SA base privée."""
+    with tenant_context(company.id):
+        return _company_stats_in_tenant(company)
+
+
+def _company_stats_in_tenant(company):
     since = utcnow() - timedelta(days=30)
     sales = Sale.query.filter(Sale.company_id == company.id, Sale.status != "annulee",
                               Sale.created_at >= since)
@@ -3305,6 +3624,15 @@ proinvoices_bp = Blueprint("proinvoices", __name__, url_prefix="/factures-pro")
 PUBLIC_ENDPOINTS = {"proinvoices.public_pdf"}
 
 
+def _register_share_link(token):
+    db.session.add(ShareLink(token=token, company_id=current_company_id()))
+
+
+def _forget_share_link(token):
+    if token:
+        ShareLink.query.filter_by(token=token, company_id=current_company_id()).delete()
+
+
 def whatsapp_number(phone):
     """Numéro au format international sans « + » (Guinée par défaut : 224)."""
     digits = re.sub(r"\D", "", phone or "")
@@ -3463,6 +3791,7 @@ def edit(invoice_id=None):
             invoice = ProInvoice(number=next_reference(ProInvoice, "number", prefix),
                                  share_token=secrets.token_urlsafe(24), user_id=current_user.id)
             db.session.add(invoice)
+            _register_share_link(invoice.share_token)
         _apply(invoice, values, lines)
         audit("facture_pro_creee" if creating else "facture_pro_modifiee", f"{invoice.number} {invoice.client_name}")
         db.session.commit()
@@ -3520,18 +3849,24 @@ def public_pdf(token):
     """Lien envoyé au client par WhatsApp : ouvre le PDF sans connexion."""
     if not token or len(token) < 20:
         abort(404)
-    invoice = (ProInvoice.query.execution_options(skip_tenant=True)
-               .filter(ProInvoice.share_token == token).first())
-    if invoice is None:
+    link = db.session.get(ShareLink, token)
+    if link is None:
         abort(404)
-    return _pdf_response(invoice, inline=True)
+    # On ouvre uniquement la base de l'entreprise propriétaire du lien
+    with tenant_context(link.company_id):
+        invoice = ProInvoice.query.filter(ProInvoice.share_token == token).first()
+        if invoice is None:
+            abort(404)
+        return _pdf_response(invoice, inline=True)
 
 
 @proinvoices_bp.route("/<int:invoice_id>/nouveau-lien", methods=["POST"])
 @login_required
 def new_link(invoice_id):
     invoice = _get(invoice_id)
+    _forget_share_link(invoice.share_token)
     invoice.share_token = secrets.token_urlsafe(24)
+    _register_share_link(invoice.share_token)
     audit("facture_pro_lien", invoice.number)
     db.session.commit()
     flash("Nouveau lien créé : l'ancien lien ne fonctionne plus.", "success")
@@ -3549,6 +3884,7 @@ def duplicate(invoice_id):
                       client_email=source.client_email, client_nif=source.client_nif,
                       payment_method=source.payment_method, discount=source.discount,
                       tax_rate=source.tax_rate, amount_paid=0, notes=source.notes)
+    _register_share_link(copy.share_token)
     for line in source.lines:
         copy.lines.append(ProInvoiceLine(position=line.position, designation=line.designation,
                                          quantity=line.quantity, unit_price=line.unit_price))
@@ -3564,6 +3900,7 @@ def duplicate(invoice_id):
 def proinvoices_delete(invoice_id):
     invoice = _get(invoice_id)
     audit("facture_pro_supprimee", f"{invoice.number} {invoice.client_name}")
+    _forget_share_link(invoice.share_token)
     db.session.delete(invoice)
     db.session.commit()
     flash("Document supprimé.", "success")
@@ -3602,6 +3939,8 @@ def create_app(config_class=Config):
     with app.app_context():
         init_database(app)
         # Ferme les connexions ouvertes avant que gunicorn ne crée ses workers
+        db.session.remove()
+        dispose_tenant_engines()
         db.engine.dispose()
 
     return app
